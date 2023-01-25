@@ -82,6 +82,10 @@ type mysqlSink struct {
 	// error is set when the sink has encountered an
 	// error and cannot work anymore.
 	error atomic.Error
+
+	// implement stmtCache to improve performance, especially when the downstream is TiDB
+	stmtCache map[string]*sql.Stmt
+	cacheLock sync.Mutex
 }
 
 // NewMySQLSink creates a new MySQL sink using schema storage
@@ -674,7 +678,23 @@ func (s *mysqlSink) execDMLWithMaxRetries(pctx context.Context, dmls *preparedDM
 				args := dmls.values[i]
 				log.Debug("exec row", zap.String("sql", query), zap.Any("args", args))
 				ctx, cancelFunc := context.WithTimeout(pctx, writeTimeout)
-				if _, err := tx.ExecContext(ctx, query, args...); err != nil {
+				s.cacheLock.Lock()
+				stmt, ok := s.stmtCache[query]
+				s.cacheLock.Unlock()
+
+				if !ok {
+					var err error
+					stmt, err = s.db.Prepare(query)
+					if err != nil {
+						cancelFunc()
+						return 0, errors.Trace(err)
+					}
+
+					s.cacheLock.Lock()
+					s.stmtCache[query] = stmt
+					s.cacheLock.Unlock()
+				}
+				if _, err := tx.Stmt(stmt).ExecContext(ctx, args...); err != nil {
 					if rbErr := tx.Rollback(); rbErr != nil {
 						if errors.Cause(rbErr) != context.Canceled {
 							log.Warn("failed to rollback txn", zap.Error(err))
